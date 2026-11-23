@@ -239,7 +239,18 @@ rebuild() {
     return 1
   fi
   mv "$tmp" "$XCONF"; chmod 644 "$XCONF"
+  fix_xray_log
   systemctl restart xray
+}
+
+# tes konfigurasi dijalankan sebagai root dan bisa membuat error.log milik root;
+# kembalikan kepemilikannya ke user layanan Xray agar layanan bisa menulis log
+fix_xray_log() {
+  local xu
+  xu=$(systemctl show -p User --value xray 2>/dev/null)
+  mkdir -p /var/log/xray
+  [ -n "$xu" ] && chown -R "$xu": /var/log/xray 2>/dev/null
+  return 0
 }
 
 user_exists() { jq -e --arg p "$1" --arg u "$2" 'any(.[]; .proto==$p and .user==$u)' "$DB" >/dev/null; }
@@ -377,7 +388,7 @@ header_main() {
     r2=$(<"/sys/class/net/$ifc/statistics/rx_bytes"); t2=$(<"/sys/class/net/$ifc/statistics/tx_bytes")
     mbit=$(awk -v a="$r1" -v b="$t1" -v c="$r2" -v d="$t2" 'BEGIN{printf "%.2f", ((c-a)+(d-b))*8/0.4/1000000}')
   fi
-  read -r nv nl nt < <(jq -r '[map(select(.proto=="vmess"))|length, map(select(.proto=="vless"))|length, map(select(.proto=="trojan"))|length]|@tsv' "$DB" 2>/dev/null)
+  read -r nv nl nt < <(jq -r '[ (map(select(.proto=="vmess"))|length), (map(select(.proto=="vless"))|length), (map(select(.proto=="trojan"))|length) ] | @tsv' "$DB" 2>/dev/null)
 
   top; title "$(brand_get name 'TUNNELKU VPN')"; mid
   row OS "$os"; row RAM "${ram:--}MB"; row SWAP "${swap:--}MB"
