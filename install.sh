@@ -221,7 +221,8 @@ issue_cert() {
 db_init() { mkdir -p "$ETC"; [ -s "$DB" ] || echo '[]' > "$DB"; chmod 600 "$DB"; }
 
 rebuild() {
-  local tmp="$XCONF.tmp"
+  # nama sementara harus berakhiran .json, kalau tidak Xray gagal mengenali formatnya
+  local tmp="${XCONF%.json}.new.json" out
   jq --slurpfile u "$DB" '
     def cl(p): [ $u[0][] | select(.proto==p)
         | if   p=="trojan" then {password:.id, email:.user}
@@ -231,9 +232,11 @@ rebuild() {
       if   (.tag|startswith("vless"))  then .settings.clients = cl("vless")
       elif (.tag|startswith("vmess"))  then .settings.clients = cl("vmess")
       elif (.tag|startswith("trojan")) then .settings.clients = cl("trojan")
-      else . end)' "$BASE" > "$tmp" || { rm -f "$tmp"; return 1; }
-  if ! xray run -test -config "$tmp" >/dev/null 2>&1; then
-    rm -f "$tmp"; warn "Config Xray tidak valid, perubahan dibatalkan."; return 1
+      else . end)' "$BASE" > "$tmp" || { rm -f "$tmp"; warn "Gagal menyusun config (jq)."; return 1; }
+  if ! out=$(xray run -test -format json -config "$tmp" 2>&1); then
+    rm -f "$tmp"; warn "Config Xray tidak valid, perubahan dibatalkan."
+    echo "$out" | grep -v '\[Warning\]' | tail -n 10 >&2
+    return 1
   fi
   mv "$tmp" "$XCONF"; chmod 644 "$XCONF"
   systemctl restart xray
