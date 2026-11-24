@@ -26,6 +26,9 @@ NGX_CONF="/etc/nginx/conf.d/$NAME.conf"
 ACME="/root/.acme.sh/acme.sh"
 LOCK="$ETC/.lock"
 INFO="$ETC/ipinfo.json"
+ACCESS_LOG="/var/log/xray/access.log"
+STATS_SERVER="127.0.0.1:10085"
+TKPY="/usr/local/lib/$NAME/tk.py"
 LOG="/var/log/$NAME-install.log"
 
 R='\033[0;31m'; G='\033[0;32m'; Y='\033[0;33m'; C='\033[0;36m'; N='\033[0m'
@@ -70,8 +73,12 @@ write_base() {
   mkdir -p "$ETC"
   cat > "$BASE" <<'JSON'
 {
-  "log": { "loglevel": "warning", "access": "none", "error": "/var/log/xray/error.log" },
+  "log": { "loglevel": "warning", "access": "/var/log/xray/access.log", "error": "/var/log/xray/error.log" },
+  "stats": {},
+  "api": { "tag": "api", "services": ["StatsService"] },
+  "policy": { "levels": { "0": { "statsUserUplink": true, "statsUserDownlink": true } } },
   "inbounds": [
+    { "tag": "api", "listen": "127.0.0.1", "port": 10085, "protocol": "dokodemo-door", "settings": { "address": "127.0.0.1" } },
     { "tag": "vless-ws", "listen": "127.0.0.1", "port": 10001, "protocol": "vless",
       "settings": { "clients": [], "decryption": "none" },
       "streamSettings": { "network": "ws", "wsSettings": { "path": "/vless" } },
@@ -103,6 +110,7 @@ write_base() {
   ],
   "routing": {
     "rules": [
+      { "type": "field", "inboundTag": ["api"], "outboundTag": "api" },
       { "type": "field", "ip": ["geoip:private"], "outboundTag": "block" },
       { "type": "field", "protocol": ["bittorrent"], "outboundTag": "block" }
     ]
@@ -136,6 +144,8 @@ location /${p%%:*} {
     proxy_set_header Upgrade \$http_upgrade;
     proxy_set_header Connection "upgrade";
     proxy_set_header Host \$host;
+    proxy_set_header X-Real-IP \$remote_addr;
+    proxy_set_header X-Forwarded-For \$remote_addr;
     proxy_read_timeout 86400s;
     proxy_send_timeout 86400s;
 }
@@ -153,6 +163,7 @@ location ^~ /${p%%:*} {
     client_body_timeout 1h;
     grpc_read_timeout 1h;
     grpc_send_timeout 1h;
+    grpc_set_header X-Real-IP \$remote_addr;
     grpc_pass grpc://127.0.0.1:$port;
 }
 LOC
@@ -224,10 +235,11 @@ rebuild() {
   # nama sementara harus berakhiran .json, kalau tidak Xray gagal mengenali formatnya
   local tmp="${XCONF%.json}.new.json" out
   jq --slurpfile u "$DB" '
-    def cl(p): [ $u[0][] | select(.proto==p)
-        | if   p=="trojan" then {password:.id, email:.user}
-          elif p=="vmess"  then {id:.id, email:.user, alterId:0}
-          else                  {id:.id, email:.user} end ];
+    def cl(p): [ $u[0][] | select(.proto==p and ((.qblocked // false) | not) and ((.locked_until // 0) == 0))
+        | (.proto + "-" + .user) as $e
+        | if   p=="trojan" then {password:.id, email:$e}
+          elif p=="vmess"  then {id:.id, email:$e, alterId:0}
+          else                  {id:.id, email:$e} end ];
     .inbounds |= map(
       if   (.tag|startswith("vless"))  then .settings.clients = cl("vless")
       elif (.tag|startswith("vmess"))  then .settings.clients = cl("vmess")
@@ -255,12 +267,13 @@ fix_xray_log() {
 
 user_exists() { jq -e --arg p "$1" --arg u "$2" 'any(.[]; .proto==$p and .user==$u)' "$DB" >/dev/null; }
 
-_add_user() { # proto user detik -> mencetak id
-  local proto=$1 user=$2 secs=$3 id exp
+_add_user() { # proto user detik [id] [limit_ip] [kuota_gb] -> mencetak "id exp"
+  local proto=$1 user=$2 secs=$3 id exp ipl=${5:-0} q=${6:-0}
   id=${4:-$(cat /proc/sys/kernel/random/uuid)}
   exp=$(( $(date +%s) + secs ))
   jq --arg p "$proto" --arg u "$user" --arg i "$id" --argjson e "$exp" \
-     '. += [{proto:$p, user:$u, id:$i, exp:$e}]' "$DB" > "$DB.tmp" && mv "$DB.tmp" "$DB"
+     --argjson ip "$ipl" --argjson q "$q" \
+     '. += [{proto:$p, user:$u, id:$i, exp:$e, ip:$ip, quota:$q, used:0}]' "$DB" > "$DB.tmp" && mv "$DB.tmp" "$DB"
   rebuild >&2
   echo "$id $exp"
 }
@@ -288,10 +301,55 @@ _expire_cleanup() {
 }
 
 # ---------- tampilan akun & link ----------
+_set_limits() { # proto user limit_ip kuota_gb
+  jq --arg p "$1" --arg u "$2" --argjson ip "$3" --argjson q "$4" \
+     'map(if .proto==$p and .user==$u
+          then (.ip = $ip | .quota = $q | .qblocked = (($q > 0) and ((.used // 0) >= ($q * 1073741824))))
+          else . end)' "$DB" > "$DB.tmp" && mv "$DB.tmp" "$DB"
+  rebuild
+}
+
+_reset_usage() { # proto user
+  jq --arg p "$1" --arg u "$2" \
+     'map(if .proto==$p and .user==$u then (.used = 0 | .qblocked = false | .locked_until = 0) else . end)' \
+     "$DB" > "$DB.tmp" && mv "$DB.tmp" "$DB"
+  rebuild
+}
+
+# Baca pemakaian dari Xray stats API, blokir kuota habis, kunci IP berlebih
+_enforce_limits() {
+  local sf rc
+  if [ -f "$ACCESS_LOG" ] && [ "$(stat -c %s "$ACCESS_LOG" 2>/dev/null || echo 0)" -gt 52428800 ]; then
+    : > "$ACCESS_LOG"
+  fi
+  sf=$(mktemp)
+  xray api statsquery --server="$STATS_SERVER" -pattern "user>>>" -reset > "$sf" 2>/dev/null || : > "$sf"
+  rc=$(python3 "$TKPY" enforce "$DB" "$sf" "$ACCESS_LOG" 2>/dev/null)
+  rm -f "$sf"
+  [ "$rc" = 1 ] && rebuild
+  return 0
+}
+
+# "email ip" untuk koneksi baru dalam N detik terakhir
+online_pairs() { [ -r "$ACCESS_LOG" ] && python3 "$TKPY" online "$ACCESS_LOG" "${1:-180}"; return 0; }
+
+id_exists() { jq -e --arg p "$1" --arg i "$2" 'any(.[]; .proto==$p and .id==$i)' "$DB" >/dev/null 2>&1; }
+
+# byte -> teks (KB/MB/GB)
+hb() { awk -v b="${1:-0}" 'BEGIN{split("B KB MB GB TB",a," "); i=1; while(b>=1024&&i<5){b/=1024;i++}; f=(i==1?"%d %s":"%.2f %s"); printf f, b, a[i]}'; }
+
+
 add_user()       { locked _add_user "$@"; }
 del_user()       { locked _del_user "$@"; }
 renew_user()     { locked _renew_user "$@"; }
 expire_cleanup() { locked _expire_cleanup "$@"; }
+set_limits()     { locked _set_limits "$@"; }
+reset_usage()    { locked _reset_usage "$@"; }
+enforce_limits() {
+  [ -s "$DB" ] || return 0
+  systemctl is-active --quiet xray || return 0
+  locked _enforce_limits
+}
 
 vmess_link() { # domain id ps port net path tls type
   jq -nc --arg add "$1" --arg id "$2" --arg ps "$3" --arg port "$4" --arg net "$5" \
@@ -305,6 +363,10 @@ show_account() { # proto user id exp
   local proto=$1 user=$2 id=$3 exp=$4 d up=${1^^} L ltls lnon lgrpc
   L="————————————————————————————————————"
   d=$(cat "$DOMAIN_FILE" 2>/dev/null)
+  local lip=0 lq=0 lu=0 ltxt qtxt
+  read -r lip lq lu < <(jq -r --arg p "$proto" --arg u "$user" '.[] | select(.proto==$p and .user==$u) | [(.ip // 0), (.quota // 0), (.used // 0)] | @tsv' "$DB" 2>/dev/null)
+  if [ "${lip:-0}" -gt 0 ] 2>/dev/null; then ltxt="$lip IP"; else ltxt="Unlimited"; fi
+  if awk -v q="${lq:-0}" 'BEGIN{exit !(q>0)}'; then qtxt="$lq GB (terpakai $(hb "${lu:-0}"))"; else qtxt="Unlimited (terpakai $(hb "${lu:-0}"))"; fi
   case "$proto" in
     vless)
       ltls="vless://$id@$d:443?encryption=none&security=tls&sni=$d&type=ws&host=$d&path=%2Fvless#$user"
@@ -325,7 +387,7 @@ show_account() { # proto user id exp
   [ "$proto" != trojan ] && printf '%-15s: %s\n' "Port none TLS" "80"
   if [ "$proto" = trojan ]; then printf '%-15s: %s\n' "Password" "$id"; else printf '%-15s: %s\n' "id" "$id"; fi
   [ "$proto" = vmess ] && printf '%-15s: %s\n' "alterId" "0" "Security" "auto"
-  printf '%-15s: %s\n' "network" "ws / grpc" "path ws" "/$proto" "serviceName" "$proto-grpc" "Expired On" "$(fmt_date "$exp")"
+  printf '%-15s: %s\n' "network" "ws / grpc" "path ws" "/$proto" "serviceName" "$proto-grpc" "Expired On" "$(fmt_date "$exp")" "Limit IP" "$ltxt" "Kuota" "$qtxt"
   echo "$L"; printf '%*s%s\n' 12 '' "$up WS TLS"; echo "$L"; echo "$ltls"
   if [ -n "$lnon" ]; then
     echo "$L"; printf '%*s%s\n' 11 '' "$up WS NO TLS"; echo "$L"; echo "$lnon"
@@ -334,6 +396,133 @@ show_account() { # proto user id exp
   echo "$L"
 }
 __TUNNELKU_COMMON__
+  cat > /usr/local/lib/tunnelku/tk.py <<'__TUNNELKU_TKPY__'
+#!/usr/bin/env python3
+# tunnelku - penegakan limit IP & kuota, serta daftar user online
+import json
+import os
+import re
+import sys
+import time
+from datetime import datetime, timedelta
+
+WINDOW = 180      # detik: jendela deteksi IP / "online"
+LOCK_SECS = 900   # lama akun dikunci jika melebihi limit IP
+GB = 1073741824
+LINE = re.compile(
+    r'^(\d{4}/\d\d/\d\d \d\d:\d\d:\d\d)\S* from (?:(?:tcp|udp):)?(\S+) accepted .*?email: (\S+)')
+
+
+def ip_of(addr):
+    m = re.match(r'^\[(.*)\]:\d+$', addr)
+    if m:
+        return m.group(1)
+    if addr.count(':') == 1:
+        return addr.split(':')[0]
+    return addr
+
+
+def online(log, window=WINDOW):
+    """{email: set(ip)} untuk koneksi baru dalam `window` detik terakhir."""
+    out = {}
+    try:
+        size = os.path.getsize(log)
+        with open(log, 'rb') as f:
+            if size > 8 * 1024 * 1024:
+                f.seek(size - 8 * 1024 * 1024)
+            data = f.read().decode('utf-8', 'replace')
+    except OSError:
+        return out
+    cutoff = (datetime.now() - timedelta(seconds=window)).strftime('%Y/%m/%d %H:%M:%S')
+    for line in data.splitlines():
+        m = LINE.match(line)
+        if not m or m.group(1) < cutoff:
+            continue
+        out.setdefault(m.group(3), set()).add(ip_of(m.group(2)))
+    return out
+
+
+def load(path):
+    try:
+        with open(path) as f:
+            d = json.load(f)
+        return d if isinstance(d, list) else None
+    except (OSError, ValueError):
+        return None
+
+
+def save(path, db):
+    tmp = path + '.tmp'
+    with open(tmp, 'w') as f:
+        json.dump(db, f)
+    try:
+        os.chmod(tmp, os.stat(path).st_mode & 0o777)
+    except OSError:
+        pass
+    os.replace(tmp, path)
+
+
+def key(u):
+    return u['proto'] + '-' + u['user']
+
+
+def blocked(u):
+    return bool(u.get('qblocked')) or (u.get('locked_until') or 0) > 0
+
+
+def traffic(stats_path):
+    """Hasil `xray api statsquery` -> {email: total byte}."""
+    try:
+        with open(stats_path) as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    tot = {}
+    for s in data.get('stat') or []:
+        p = (s.get('name') or '').split('>>>')
+        if len(p) == 4 and p[0] == 'user' and p[2] == 'traffic' and p[3] in ('uplink', 'downlink'):
+            try:
+                tot[p[1]] = tot.get(p[1], 0) + int(s.get('value') or 0)
+            except (TypeError, ValueError):
+                pass
+    return tot
+
+
+def enforce(db_path, stats_path, log):
+    """Tambah pemakaian, blokir kuota habis, kunci IP berlebih. -> 1 jika config perlu dibangun ulang."""
+    db = load(db_path)
+    if db is None:
+        return 0
+    before = [blocked(u) for u in db]
+    now = int(time.time())
+    use = traffic(stats_path)
+    on = online(log)
+    for u in db:
+        u['used'] = int(u.get('used') or 0) + use.get(key(u), 0)
+        if 0 < (u.get('locked_until') or 0) <= now:
+            u['locked_until'] = 0
+        q = float(u.get('quota') or 0)
+        if q > 0 and u['used'] >= q * GB:
+            u['qblocked'] = True
+        lim = int(u.get('ip') or 0)
+        if lim > 0 and not (u.get('locked_until') or 0) and len(on.get(key(u), ())) > lim:
+            u['locked_until'] = now + LOCK_SECS
+    save(db_path, db)
+    return int([blocked(u) for u in db] != before)
+
+
+if __name__ == '__main__':
+    cmd = sys.argv[1] if len(sys.argv) > 1 else ''
+    if cmd == 'enforce' and len(sys.argv) >= 5:
+        print(enforce(sys.argv[2], sys.argv[3], sys.argv[4]))
+    elif cmd == 'online' and len(sys.argv) >= 3:
+        win = int(sys.argv[3]) if len(sys.argv) > 3 else WINDOW
+        for e, ips in sorted(online(sys.argv[2], win).items()):
+            for ip in sorted(ips):
+                print(e, ip)
+    else:
+        sys.exit(2)
+__TUNNELKU_TKPY__
   cat > /usr/local/bin/tunnelku <<'__TUNNELKU_MENU__'
 #!/bin/bash
 # tunnelku - menu pengelola (tampilan box)
@@ -346,11 +535,12 @@ LIB="/usr/local/lib/tunnelku/common.sh"
 
 case "${1:-}" in
   --expire)  expire_cleanup; exit 0 ;;
+  --enforce) enforce_limits; exit 0 ;;
   --rebuild) rebuild; exit $? ;;
   -h|--help) echo "Pemakaian: $NAME [--expire|--rebuild]"; exit 0 ;;
 esac
 
-VERSION="v1.1.0"
+VERSION="v1.2.0"
 CYAN='\033[0;36m'; YELLOW='\033[0;33m'; GREEN='\033[0;32m'; RED='\033[0;31m'
 PURPLE='\033[0;35m'; WHITE='\033[1;37m'; NC='\033[0m'
 HR=$(printf '─%.0s' $(seq 1 55))
@@ -368,6 +558,8 @@ title() { local t=$1 pad; pad=$(( (55 - ${#t}) / 2 )); [ "$pad" -lt 1 ] && pad=1
           echo -e "${CYAN}│${NC}$(printf '%*s' "$pad" '')${YELLOW}${t}${NC}"; }
 row()   { printf "${CYAN}│${NC} %-8s: ${3:-$WHITE}%s${NC}\n" "$1" "$2"; }
 svc()   { systemctl is-active --quiet "$1" && echo "${GREEN}ON${NC}" || echo "${RED}OFF${NC}"; }
+statsapi() { xray api statsquery --server="$STATS_SERVER" -pattern "user>>>" >/dev/null 2>&1 && echo "${GREEN}ON${NC}" || echo "${RED}OFF${NC}"; }
+logstate() { [ -f "$ACCESS_LOG" ] && echo "${GREEN}ADA${NC}" || echo "${RED}BELUM${NC}"; }
 iface() { ip -4 route show default 2>/dev/null | awk '{for(i=1;i<NF;i++) if($i=="dev"){print $(i+1); exit}}'; }
 brand_get() { local v; v=$(jq -r --arg k "$1" '.[$k] // empty' "$BRAND_FILE" 2>/dev/null); echo "${v:-$2}"; }
 
@@ -431,20 +623,30 @@ pick_account() { # [proto] -> SEL_PROTO SEL_USER SEL_ID SEL_EXP
 }
 
 # ---------- aksi akun ----------
+ask_limits() { # default_ip default_gb -> LIM_IP LIM_Q (return 1 jika tidak valid)
+  read -rp " Limit IP / perangkat (0 = tanpa batas) [$1]: " LIM_IP; LIM_IP=${LIM_IP:-$1}
+  [[ $LIM_IP =~ ^[0-9]+$ ]] || { warn "Limit IP harus angka bulat."; return 1; }
+  read -rp " Kuota GB (0 = tanpa batas) [$2]: " LIM_Q; LIM_Q=${LIM_Q:-$2}
+  [[ $LIM_Q =~ ^[0-9]+(\.[0-9]+)?$ ]] || { warn "Kuota harus angka (boleh desimal, contoh 0.5)."; return 1; }
+}
+
 do_create() { # proto
-  local P=$1 u days uid="" id exp
+  local P=$1 u cid lbl days id exp
   read -rp " Username (huruf/angka/_ , 3-20): " u
   [[ $u =~ ^[A-Za-z0-9_]{3,20}$ ]] || { warn "Username tidak valid."; pause; return; }
   user_exists "$P" "$u" && { warn "Username sudah ada di $P."; pause; return; }
-  if [ "$P" != trojan ]; then
-    read -rp " UUID (Enter = acak): " uid
-    if [ -n "$uid" ] && ! [[ $uid =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; then
-      warn "Format UUID tidak valid."; pause; return
-    fi
+  [ "$P" = trojan ] && lbl="Password" || lbl="UUID"
+  echo " $lbl: Enter = acak, atau ketik kata sendiri (3-30 huruf/angka/_/-)."
+  echo " Kata pendek mudah ditebak orang lain; pilih yang unik."
+  read -rp " $lbl: " cid
+  if [ -n "$cid" ]; then
+    [[ $cid =~ ^[A-Za-z0-9_-]{3,30}$ ]] || { warn "$lbl hanya boleh 3-30 huruf/angka/_/-."; pause; return; }
+    id_exists "$P" "$cid" && { warn "$lbl itu sudah dipakai akun lain."; pause; return; }
   fi
   read -rp " Expired (hari) [30]: " days; days=${days:-30}
   [[ $days =~ ^[0-9]+$ ]] && [ "$days" -ge 1 ] || { warn "Masa aktif tidak valid."; pause; return; }
-  read -r id exp < <(add_user "$P" "$u" $((days*86400)) "$uid")
+  ask_limits 2 0 || { pause; return; }
+  read -r id exp < <(add_user "$P" "$u" $((days*86400)) "$cid" "$LIM_IP" "$LIM_Q")
   [ -n "${id:-}" ] || { warn "Gagal membuat akun."; pause; return; }
   clear; show_account "$P" "$u" "$id" "$exp"; pause
 }
@@ -455,8 +657,9 @@ do_trial() {
   local m u id exp
   read -rp " Durasi trial (menit) [60]: " m; m=${m:-60}
   [[ $m =~ ^[0-9]+$ ]] && [ "$m" -ge 1 ] || { warn "Durasi tidak valid."; pause; return; }
+  ask_limits 1 1 || { pause; return; }
   u="trial$(tr -dc 'a-z0-9' </dev/urandom | head -c 5)"
-  read -r id exp < <(add_user "$PROTO" "$u" $((m*60)))
+  read -r id exp < <(add_user "$PROTO" "$u" $((m*60)) "" "$LIM_IP" "$LIM_Q")
   [ -n "${id:-}" ] || { warn "Gagal membuat akun."; pause; return; }
   clear; show_account "$PROTO" "$u" "$id" "$exp"
   echo " (akun trial dihapus otomatis maksimal 5 menit setelah kedaluwarsa)"; pause
@@ -488,10 +691,57 @@ do_check() { # proto
 do_list() { # proto
   local n; n=$(jq --arg p "$1" '[.[] | select(.proto==$p)] | length' "$DB")
   if [ "${n:-0}" -eq 0 ]; then warn "Belum ada akun."; pause; return; fi
-  printf " %-20s %s\n" USERNAME EXPIRED
-  jq -r --arg p "$1" '.[] | select(.proto==$p) | [.user,(.exp|tostring)] | @tsv' "$DB" | while IFS=$'\t' read -r u e; do
-    printf " %-20s %s\n" "$u" "$(fmt_date "$e")"
-  done
+  printf " %-14s %-16s %-3s %-22s %s\n" USERNAME EXPIRED IP "PAKAI/KUOTA" STATUS
+  jq -r --arg p "$1" '.[] | select(.proto==$p) | [.user, (.exp|tostring), ((.ip // 0)|tostring), ((.quota // 0)|tostring), ((.used // 0)|tostring), ((.qblocked // false)|tostring), ((.locked_until // 0)|tostring)] | @tsv' "$DB" \
+  | while IFS=$'\t' read -r u e ip q used qb lu; do
+      local st="OK" qt="Unlimited"
+      [ "$q" != "0" ] && qt="${q}GB"
+      [ "$lu" != "0" ] && st="TERKUNCI (limit IP)"
+      [ "$qb" = "true" ] && st="KUOTA HABIS"
+      printf " %-14s %-16s %-3s %-22s %s\n" "$u" "$(fmt_date "$e")" "$ip" "$(hb "$used") / $qt" "$st"
+    done
+  pause
+}
+
+do_limits() { # proto
+  local o cip cq ipl q
+  pick_account "$1" || { pause; return; }
+  read -r cip cq < <(jq -r --arg p "$SEL_PROTO" --arg u "$SEL_USER" '.[] | select(.proto==$p and .user==$u) | [(.ip // 0), (.quota // 0)] | @tsv' "$DB")
+  echo " Akun: $SEL_PROTO/$SEL_USER   (limit IP: ${cip:-0}, kuota: ${cq:-0} GB)"
+  echo " [1] Ubah limit IP & kuota"
+  echo " [2] Reset pemakaian & buka blokir/kunci"
+  read -rp " Pilih: " o
+  case "$o" in
+    1) ask_limits "${cip:-0}" "${cq:-0}" || { pause; return; }
+       set_limits "$SEL_PROTO" "$SEL_USER" "$LIM_IP" "$LIM_Q" && ok "Limit diperbarui." ;;
+    2) reset_usage "$SEL_PROTO" "$SEL_USER" && ok "Pemakaian di-reset, akun dibuka." ;;
+    *) return ;;
+  esac
+  pause
+}
+
+do_online() { # [proto]
+  local P=${1:-} pairs any=0 pr us key lim ips n mark
+  if [ ! -r "$ACCESS_LOG" ]; then
+    warn "Log akses Xray belum ada. Jalankan ulang installer versi terbaru."; pause; return
+  fi
+  pairs=$(online_pairs 180)
+  printf " %-7s %-14s %-3s %-5s %s\n" PROTO USERNAME IP LIMIT ALAMAT-IP
+  while IFS=$'\t' read -r pr us key lim; do
+    ips=$(printf '%s\n' "$pairs" | awk -v k="$key" '$1==k{print $2}' | paste -sd, -)
+    [ -z "$ips" ] && continue
+    any=1
+    n=$(printf '%s\n' "$ips" | tr ',' '\n' | wc -l)
+    mark=""; [ "$lim" != "0" ] && [ "$n" -gt "$lim" ] && mark=" <-- melebihi"
+    printf " %-7s %-14s %-3s %-5s %s%s\n" "$pr" "$us" "$n" "$([ "$lim" = 0 ] && echo - || echo "$lim")" "$ips" "$mark"
+  done < <(jq -r --arg p "$P" '.[] | select($p=="" or .proto==$p) | [.proto, .user, (.proto + "-" + .user), ((.ip // 0)|tostring)] | @tsv' "$DB")
+  [ "$any" -eq 0 ] && echo " Tidak ada user yang membuat koneksi dalam 3 menit terakhir."
+  if [ -n "$pairs" ] && [ "$(printf '%s\n' "$pairs" | awk '{print $2}' | sort -u)" = "127.0.0.1" ]; then
+    echo
+    warn "Xray hanya melihat IP 127.0.0.1: IP asli klien tidak diteruskan, limit IP tidak akan bekerja."
+  fi
+  echo
+  echo " Catatan: 'online' = ada koneksi baru dalam 3 menit terakhir."
   pause
 }
 
@@ -505,12 +755,15 @@ proto_menu() { # proto
     line "[3] Delete Account $N"
     line "[4] Check Config User"
     line "[5] List Account $N"
+    line "[6] Limit IP / Kuota $N"
+    line "[7] Check User Login $N"
     line "[x] Back"
     sep
     read -rp " Select Menu : " opt
     case "$opt" in
       1) do_create "$P" ;; 2) do_renew "$P" ;; 3) do_del "$P" ;;
-      4) do_check "$P" ;;  5) do_list "$P" ;;  x|X|0) return ;;
+      4) do_check "$P" ;;  5) do_list "$P" ;;
+      6) do_limits "$P" ;; 7) do_online "$P" ;;  x|X|0) return ;;
     esac
   done
 }
@@ -614,12 +867,13 @@ features_menu() {
     line "[6] Information System"
     line "[7] Update Info IP / Kota / ISP"
     line "[8] Ubah Brand / Owner / Telegram"
+    line "[9] Check User Login (semua protokol)"
     line "[x] Back"
     sep
     read -rp " Select Menu : " opt
     case "$opt" in
       1) do_bandwidth ;; 2) do_speedtest ;; 3) do_restart_all ;; 4) do_clearcache ;;
-      5) do_autoreboot ;; 6) do_sysinfo ;; 7) do_ipinfo ;; 8) do_brand ;;
+      5) do_autoreboot ;; 6) do_sysinfo ;; 7) do_ipinfo ;; 8) do_brand ;; 9) do_online "" ;;
       x|X|0) return ;;
     esac
   done
@@ -628,7 +882,7 @@ features_menu() {
 check_services() {
   header_sub "SERVICES STATUS"
   top; title "SERVICES STATUS"; mid
-  printf "${CYAN}│${NC} %-14s: %b\n" "Xray Core" "$(svc xray)" "Nginx" "$(svc nginx)" "Cron" "$(svc cron)" "Vnstat Mon" "$(svc vnstat)"
+  printf "${CYAN}│${NC} %-14s: %b\n" "Xray Core" "$(svc xray)" "Nginx" "$(svc nginx)" "Cron" "$(svc cron)" "Vnstat Mon" "$(svc vnstat)" "Stats API" "$(statsapi)" "Access Log" "$(logstate)"
   bot; pause
 }
 
@@ -706,6 +960,7 @@ while true; do
 done
 __TUNNELKU_MENU__
   chmod 644 /usr/local/lib/tunnelku/common.sh
+  chmod 755 /usr/local/lib/tunnelku/tk.py
   chmod 755 /usr/local/bin/tunnelku
 }
 
@@ -726,7 +981,7 @@ fi
 msg "Memasang paket... (log: $LOG)"
 run_log apt-get update -y
 export DEBIAN_FRONTEND=noninteractive
-run_log apt-get install -y curl jq nginx socat cron openssl tar ca-certificates unzip iproute2 util-linux vnstat \
+run_log apt-get install -y curl jq nginx socat cron openssl tar ca-certificates unzip iproute2 util-linux vnstat python3 \
   || { tail -n 15 "$LOG"; die "Gagal memasang paket dasar. Log lengkap: $LOG"; }
 
 msg "Memasang Xray..."
@@ -746,7 +1001,9 @@ write_nginx || die "Konfigurasi nginx gagal."
 rebuild || die "Konfigurasi Xray gagal."
 systemctl enable --now xray >/dev/null 2>&1
 
-echo "*/5 * * * * root /usr/local/bin/tunnelku --expire >/dev/null 2>&1" > /etc/cron.d/tunnelku
+printf '%s\n' \
+  "*/5 * * * * root /usr/local/bin/tunnelku --expire >/dev/null 2>&1" \
+  "* * * * * root /usr/local/bin/tunnelku --enforce >/dev/null 2>&1" > /etc/cron.d/tunnelku
 chmod 644 /etc/cron.d/tunnelku
 
 echo
