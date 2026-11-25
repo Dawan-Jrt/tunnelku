@@ -81,27 +81,27 @@ write_base() {
     { "tag": "api", "listen": "127.0.0.1", "port": 10085, "protocol": "dokodemo-door", "settings": { "address": "127.0.0.1" } },
     { "tag": "vless-ws", "listen": "127.0.0.1", "port": 10001, "protocol": "vless",
       "settings": { "clients": [], "decryption": "none" },
-      "streamSettings": { "network": "ws", "wsSettings": { "path": "/vless" } },
+      "streamSettings": { "sockopt": { "trustedXForwardedFor": ["X-Real-IP"] }, "network": "ws", "wsSettings": { "path": "/vless" } },
       "sniffing": { "enabled": true, "destOverride": ["http", "tls"] } },
     { "tag": "vmess-ws", "listen": "127.0.0.1", "port": 10002, "protocol": "vmess",
       "settings": { "clients": [] },
-      "streamSettings": { "network": "ws", "wsSettings": { "path": "/vmess" } },
+      "streamSettings": { "sockopt": { "trustedXForwardedFor": ["X-Real-IP"] }, "network": "ws", "wsSettings": { "path": "/vmess" } },
       "sniffing": { "enabled": true, "destOverride": ["http", "tls"] } },
     { "tag": "trojan-ws", "listen": "127.0.0.1", "port": 10003, "protocol": "trojan",
       "settings": { "clients": [] },
-      "streamSettings": { "network": "ws", "wsSettings": { "path": "/trojan" } },
+      "streamSettings": { "sockopt": { "trustedXForwardedFor": ["X-Real-IP"] }, "network": "ws", "wsSettings": { "path": "/trojan" } },
       "sniffing": { "enabled": true, "destOverride": ["http", "tls"] } },
     { "tag": "vless-grpc", "listen": "127.0.0.1", "port": 10011, "protocol": "vless",
       "settings": { "clients": [], "decryption": "none" },
-      "streamSettings": { "network": "grpc", "grpcSettings": { "serviceName": "vless-grpc" } },
+      "streamSettings": { "sockopt": { "trustedXForwardedFor": ["X-Real-IP"] }, "network": "grpc", "grpcSettings": { "serviceName": "vless-grpc" } },
       "sniffing": { "enabled": true, "destOverride": ["http", "tls"] } },
     { "tag": "vmess-grpc", "listen": "127.0.0.1", "port": 10012, "protocol": "vmess",
       "settings": { "clients": [] },
-      "streamSettings": { "network": "grpc", "grpcSettings": { "serviceName": "vmess-grpc" } },
+      "streamSettings": { "sockopt": { "trustedXForwardedFor": ["X-Real-IP"] }, "network": "grpc", "grpcSettings": { "serviceName": "vmess-grpc" } },
       "sniffing": { "enabled": true, "destOverride": ["http", "tls"] } },
     { "tag": "trojan-grpc", "listen": "127.0.0.1", "port": 10013, "protocol": "trojan",
       "settings": { "clients": [] },
-      "streamSettings": { "network": "grpc", "grpcSettings": { "serviceName": "trojan-grpc" } },
+      "streamSettings": { "sockopt": { "trustedXForwardedFor": ["X-Real-IP"] }, "network": "grpc", "grpcSettings": { "serviceName": "trojan-grpc" } },
       "sniffing": { "enabled": true, "destOverride": ["http", "tls"] } }
   ],
   "outbounds": [
@@ -164,6 +164,7 @@ location ^~ /${p%%:*} {
     grpc_read_timeout 1h;
     grpc_send_timeout 1h;
     grpc_set_header X-Real-IP \$remote_addr;
+    grpc_set_header X-Forwarded-For \$remote_addr;
     grpc_pass grpc://127.0.0.1:$port;
 }
 LOC
@@ -304,7 +305,7 @@ _expire_cleanup() {
 _set_limits() { # proto user limit_ip kuota_gb
   jq --arg p "$1" --arg u "$2" --argjson ip "$3" --argjson q "$4" \
      'map(if .proto==$p and .user==$u
-          then (.ip = $ip | .quota = $q | .qblocked = (($q > 0) and ((.used // 0) >= ($q * 1073741824))))
+          then (.ip = $ip | .quota = $q | .locked_until = 0 | .qblocked = (($q > 0) and ((.used // 0) >= ($q * 1073741824))))
           else . end)' "$DB" > "$DB.tmp" && mv "$DB.tmp" "$DB"
   rebuild
 }
@@ -399,6 +400,7 @@ __TUNNELKU_COMMON__
   cat > /usr/local/lib/tunnelku/tk.py <<'__TUNNELKU_TKPY__'
 #!/usr/bin/env python3
 # tunnelku - penegakan limit IP & kuota, serta daftar user online
+import ipaddress
 import json
 import os
 import re
@@ -413,6 +415,25 @@ LINE = re.compile(
     r'^(\d{4}/\d\d/\d\d \d\d:\d\d:\d\d)\S* from (?:(?:tcp|udp):)?(\S+) accepted .*?email: (\S+)')
 
 
+# Daftar IP Cloudflare (cloudflare.com/ips, per update 28 Sep 2023).
+# Jika domain diproxy Cloudflare, Xray hanya melihat IP Cloudflare, bukan IP klien.
+CF_NETS = [ipaddress.ip_network(n) for n in (
+    '103.21.244.0/22', '103.22.200.0/22', '103.31.4.0/22', '104.16.0.0/13',
+    '104.24.0.0/14', '108.162.192.0/18', '131.0.72.0/22', '141.101.64.0/18',
+    '162.158.0.0/15', '172.64.0.0/13', '173.245.48.0/20', '188.114.96.0/20',
+    '190.93.240.0/20', '197.234.240.0/22', '198.41.128.0/17',
+    '2400:cb00::/32', '2606:4700::/32', '2803:f800::/32', '2405:b500::/32',
+    '2405:8100::/32', '2a06:98c0::/29', '2c0f:f248::/32')]
+
+
+def is_cf(ip):
+    try:
+        a = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    return any(a.version == n.version and a in n for n in CF_NETS)
+
+
 def ip_of(addr):
     m = re.match(r'^\[(.*)\]:\d+$', addr)
     if m:
@@ -422,8 +443,9 @@ def ip_of(addr):
     return addr
 
 
-def online(log, window=WINDOW):
-    """{email: set(ip)} untuk koneksi baru dalam `window` detik terakhir."""
+def online(log, window=WINDOW, skip_cf=False):
+    """{email: set(ip)} untuk koneksi baru dalam `window` detik terakhir.
+    skip_cf=True: abaikan IP Cloudflare (bukan IP klien sebenarnya)."""
     out = {}
     try:
         size = os.path.getsize(log)
@@ -438,7 +460,10 @@ def online(log, window=WINDOW):
         m = LINE.match(line)
         if not m or m.group(1) < cutoff:
             continue
-        out.setdefault(m.group(3), set()).add(ip_of(m.group(2)))
+        ip = ip_of(m.group(2))
+        if skip_cf and is_cf(ip):
+            continue
+        out.setdefault(m.group(3), set()).add(ip)
     return out
 
 
@@ -496,7 +521,7 @@ def enforce(db_path, stats_path, log):
     before = [blocked(u) for u in db]
     now = int(time.time())
     use = traffic(stats_path)
-    on = online(log)
+    on = online(log, skip_cf=True)
     for u in db:
         u['used'] = int(u.get('used') or 0) + use.get(key(u), 0)
         if 0 < (u.get('locked_until') or 0) <= now:
@@ -519,7 +544,7 @@ if __name__ == '__main__':
         win = int(sys.argv[3]) if len(sys.argv) > 3 else WINDOW
         for e, ips in sorted(online(sys.argv[2], win).items()):
             for ip in sorted(ips):
-                print(e, ip)
+                print(e, ip, 'cf' if is_cf(ip) else '-')
     else:
         sys.exit(2)
 __TUNNELKU_TKPY__
@@ -657,7 +682,7 @@ do_trial() {
   local m u id exp
   read -rp " Durasi trial (menit) [60]: " m; m=${m:-60}
   [[ $m =~ ^[0-9]+$ ]] && [ "$m" -ge 1 ] || { warn "Durasi tidak valid."; pause; return; }
-  ask_limits 1 1 || { pause; return; }
+  ask_limits 2 1 || { pause; return; }
   u="trial$(tr -dc 'a-z0-9' </dev/urandom | head -c 5)"
   read -r id exp < <(add_user "$PROTO" "$u" $((m*60)) "" "$LIM_IP" "$LIM_Q")
   [ -n "${id:-}" ] || { warn "Gagal membuat akun."; pause; return; }
@@ -736,6 +761,10 @@ do_online() { # [proto]
     printf " %-7s %-14s %-3s %-5s %s%s\n" "$pr" "$us" "$n" "$([ "$lim" = 0 ] && echo - || echo "$lim")" "$ips" "$mark"
   done < <(jq -r --arg p "$P" '.[] | select($p=="" or .proto==$p) | [.proto, .user, (.proto + "-" + .user), ((.ip // 0)|tostring)] | @tsv' "$DB")
   [ "$any" -eq 0 ] && echo " Tidak ada user yang membuat koneksi dalam 3 menit terakhir."
+  if printf '%s\n' "$pairs" | awk '$3=="cf"{f=1} END{exit !f}'; then
+    echo
+    warn "Terbaca IP Cloudflare: domain diproxy (awan oranye), jadi IP klien asli tidak terlihat. Limit IP dinonaktifkan untuk IP Cloudflare; ubah record DNS ke DNS only (awan abu-abu) agar limit bekerja."
+  fi
   if [ -n "$pairs" ] && [ "$(printf '%s\n' "$pairs" | awk '{print $2}' | sort -u)" = "127.0.0.1" ]; then
     echo
     warn "Xray hanya melihat IP 127.0.0.1: IP asli klien tidak diteruskan, limit IP tidak akan bekerja."
