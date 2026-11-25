@@ -170,12 +170,41 @@ location ^~ /${p%%:*} {
 LOC
   done
 
+  cat > "$ETC/realip.conf" <<'RIP'
+# IP klien asli bila domain diproxy Cloudflare (hanya dipercaya dari IP Cloudflare;
+# daftar per cloudflare.com/ips, update 28 Sep 2023). Koneksi langsung tidak terpengaruh.
+set_real_ip_from 103.21.244.0/22;
+set_real_ip_from 103.22.200.0/22;
+set_real_ip_from 103.31.4.0/22;
+set_real_ip_from 104.16.0.0/13;
+set_real_ip_from 104.24.0.0/14;
+set_real_ip_from 108.162.192.0/18;
+set_real_ip_from 131.0.72.0/22;
+set_real_ip_from 141.101.64.0/18;
+set_real_ip_from 162.158.0.0/15;
+set_real_ip_from 172.64.0.0/13;
+set_real_ip_from 173.245.48.0/20;
+set_real_ip_from 188.114.96.0/20;
+set_real_ip_from 190.93.240.0/20;
+set_real_ip_from 197.234.240.0/22;
+set_real_ip_from 198.41.128.0/17;
+set_real_ip_from 2400:cb00::/32;
+set_real_ip_from 2606:4700::/32;
+set_real_ip_from 2803:f800::/32;
+set_real_ip_from 2405:b500::/32;
+set_real_ip_from 2405:8100::/32;
+set_real_ip_from 2a06:98c0::/29;
+set_real_ip_from 2c0f:f248::/32;
+real_ip_header CF-Connecting-IP;
+RIP
+
   rm -f /etc/nginx/sites-enabled/default /etc/nginx/conf.d/default.conf
   cat > "$NGX_CONF" <<CONF
 server {
     listen 80 default_server;
     $v6_80
     server_name _;
+    include $ETC/realip.conf;
     include $ETC/locations.conf;
     location / { default_type text/plain; return 404 "not found\n"; }
 }
@@ -188,6 +217,7 @@ server {
     ssl_certificate_key $CERT_DIR/key.pem;
     ssl_protocols TLSv1.2 TLSv1.3;
     ssl_session_cache shared:SSL:10m;
+    include $ETC/realip.conf;
     include $ETC/locations.conf;
     include $ETC/grpc.conf;
     location / { default_type text/plain; return 404 "not found\n"; }
@@ -752,18 +782,21 @@ do_online() { # [proto]
   fi
   pairs=$(online_pairs 180)
   printf " %-7s %-14s %-3s %-5s %s\n" PROTO USERNAME IP LIMIT ALAMAT-IP
+  local ncf addr
   while IFS=$'\t' read -r pr us key lim; do
-    ips=$(printf '%s\n' "$pairs" | awk -v k="$key" '$1==k{print $2}' | paste -sd, -)
-    [ -z "$ips" ] && continue
+    ips=$(printf '%s\n' "$pairs" | awk -v k="$key" '$1==k && $3!="cf"{print $2}' | paste -sd, -)
+    ncf=$(printf '%s\n' "$pairs" | awk -v k="$key" '$1==k && $3=="cf"{c++} END{print c+0}')
+    [ -z "$ips" ] && [ "$ncf" -eq 0 ] && continue
     any=1
-    n=$(printf '%s\n' "$ips" | tr ',' '\n' | wc -l)
+    n=0; [ -n "$ips" ] && n=$(printf '%s\n' "$ips" | tr ',' '\n' | wc -l)
     mark=""; [ "$lim" != "0" ] && [ "$n" -gt "$lim" ] && mark=" <-- melebihi"
-    printf " %-7s %-14s %-3s %-5s %s%s\n" "$pr" "$us" "$n" "$([ "$lim" = 0 ] && echo - || echo "$lim")" "$ips" "$mark"
+    addr="${ips:--}"; [ "$ncf" -gt 0 ] && addr="$addr (+$ncf IP Cloudflare)"
+    printf " %-7s %-14s %-3s %-5s %s%s\n" "$pr" "$us" "$n" "$([ "$lim" = 0 ] && echo - || echo "$lim")" "$addr" "$mark"
   done < <(jq -r --arg p "$P" '.[] | select($p=="" or .proto==$p) | [.proto, .user, (.proto + "-" + .user), ((.ip // 0)|tostring)] | @tsv' "$DB")
   [ "$any" -eq 0 ] && echo " Tidak ada user yang membuat koneksi dalam 3 menit terakhir."
   if printf '%s\n' "$pairs" | awk '$3=="cf"{f=1} END{exit !f}'; then
     echo
-    warn "Terbaca IP Cloudflare: domain diproxy (awan oranye), jadi IP klien asli tidak terlihat. Limit IP dinonaktifkan untuk IP Cloudflare; ubah record DNS ke DNS only (awan abu-abu) agar limit bekerja."
+    warn "Masih terbaca IP Cloudflare (bukan IP klien asli). Jalankan ulang installer versi terbaru; limit IP mengabaikan IP Cloudflare."
   fi
   if [ -n "$pairs" ] && [ "$(printf '%s\n' "$pairs" | awk '{print $2}' | sort -u)" = "127.0.0.1" ]; then
     echo
