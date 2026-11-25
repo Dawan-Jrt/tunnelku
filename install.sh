@@ -41,7 +41,7 @@ die()  { echo -e "${R}[X]${N} $*" >&2; exit 1; }
 run_log() { "$@" >>"$LOG" 2>&1; }
 
 # jalankan fungsi dengan kunci agar cron & menu tidak menulis users.json bersamaan
-locked() { mkdir -p "$ETC"; ( flock -w 30 9 || { echo "Gagal mendapat kunci database." >&2; exit 1; }; "$@" ) 9>"$LOCK"; }
+locked() { mkdir -p "$ETC"; ( umask 077; flock -w 30 9 || { echo "Gagal mendapat kunci database." >&2; exit 1; }; "$@" ) 9>"$LOCK"; }
 
 # baca satu field dari cache info IP/kota/ISP (JSON, tidak pernah di-source)
 info_get() { local v; v=$(jq -r --arg k "$1" '.[$k] // empty' "$INFO" 2>/dev/null); echo "${v:--}"; }
@@ -229,7 +229,7 @@ issue_cert() {
 }
 
 # ---------- database akun & sinkron ke Xray ----------
-db_init() { mkdir -p "$ETC"; [ -s "$DB" ] || echo '[]' > "$DB"; chmod 600 "$DB"; }
+db_init() { mkdir -p "$ETC"; chmod 700 "$ETC"; [ -s "$DB" ] || echo '[]' > "$DB"; chmod 600 "$DB"; }
 
 rebuild() {
   # nama sementara harus berakhiran .json, kalau tidak Xray gagal mengenali formatnya
