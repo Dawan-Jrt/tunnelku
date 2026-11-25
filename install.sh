@@ -955,4 +955,141 @@ features_menu() {
     read -rp " Select Menu : " opt
     case "$opt" in
       1) do_bandwidth ;; 2) do_speedtest ;; 3) do_restart_all ;; 4) do_clearcache ;;
-      5) do_auto                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               
+      5) do_autoreboot ;; 6) do_sysinfo ;; 7) do_ipinfo ;; 8) do_brand ;; 9) do_online "" ;; 10) do_iplock ;;
+      x|X|0) return ;;
+    esac
+  done
+}
+
+check_services() {
+  header_sub "SERVICES STATUS"
+  top; title "SERVICES STATUS"; mid
+  printf "${CYAN}│${NC} %-14s: %b\n" "Xray Core" "$(svc xray)" "Nginx" "$(svc nginx)" "Cron" "$(svc cron)" "Vnstat Mon" "$(svc vnstat)" "Stats API" "$(statsapi)" "Access Log" "$(logstate)"
+  bot; pause
+}
+
+# ---------- backup / restore ----------
+do_backup() {
+  local f="/root/$NAME-backup-$(date +%F-%H%M).tar.gz"
+  tar czf "$f" -C / "etc/$NAME" && chmod 600 "$f" && ok "Backup: $f"
+  pause
+}
+
+do_restore() {
+  local f y
+  read -rp " Path file backup (.tar.gz): " f
+  [ -f "$f" ] || { warn "File tidak ditemukan."; pause; return; }
+  # tolak backup yang berisi path di luar etc/tunnelku atau memakai ".."
+  if ! tar tzf "$f" >/dev/null 2>&1; then warn "File bukan tar.gz yang valid."; pause; return; fi
+  if tar tzf "$f" | grep -vE "^(\./)?etc/$NAME(/|$)" | grep -q . || tar tzf "$f" | grep -q '\.\.'; then
+    warn "Backup ditolak: berisi path di luar etc/$NAME."; pause; return
+  fi
+  read -rp " Ini menimpa data akun & sertifikat saat ini. Lanjut? [y/N]: " y
+  [[ $y =~ ^[yY]$ ]] || return
+  locked tar xzf "$f" -C / && write_nginx && rebuild && ok "Restore selesai."
+  pause
+}
+
+backup_menu() {
+  local opt
+  while true; do
+    header_sub "BACKUP / RESTORE"
+    line "[1] Backup Data"
+    line "[2] Restore Data"
+    line "[x] Back"
+    sep
+    read -rp " Select Menu : " opt
+    case "$opt" in 1) do_backup ;; 2) do_restore ;; x|X|0) return ;; esac
+  done
+}
+
+# ---------- uninstall ----------
+do_uninstall() {
+  clear
+  echo -e "${RED}PERINGATAN: Ini akan menghapus Xray, akun, sertifikat, dan menu ini.${NC}"
+  read -rp " Ketik HAPUS untuk uninstall semuanya: " y
+  [ "$y" = "HAPUS" ] || return
+  local d; d=$(cat "$DOMAIN_FILE" 2>/dev/null)
+  systemctl stop xray 2>/dev/null
+  bash -c "$(curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ remove >/dev/null 2>&1
+  [ -n "$d" ] && [ -x "$ACME" ] && "$ACME" --remove -d "$d" --ecc >/dev/null 2>&1
+  rm -f "$NGX_CONF" "/etc/cron.d/$NAME" "$REBOOT_CRON"
+  systemctl reload nginx 2>/dev/null
+  rm -rf "$ETC" "/usr/local/lib/$NAME" "/usr/local/bin/$NAME"
+  ok "Uninstall selesai. (nginx dan vnstat tetap terpasang)"
+  exit 0
+}
+
+# ---------- menu utama ----------
+while true; do
+  header_main
+  line "[1] VMESS ACCOUNT        [5] CHANGE DOMAIN VPS"
+  line "[2] VLESS ACCOUNT        [6] FEATURES"
+  line "[3] TROJAN ACCOUNT       [7] CHECK SERVICES"
+  line "[4] TRIAL ACCOUNT        [8] BACKUP / RESTORE"
+  line "[9] UNINSTALL SCRIPT     [x] EXIT"
+  sep
+  top
+  printf "${CYAN}│${NC}  %-10s:  %s\n" Version "$VERSION" Owner "$(brand_get owner '-')" Telegram "$(brand_get telegram '-')"
+  bot
+  read -rp " Select Menu : " opt
+  case "$opt" in
+    1) proto_menu vmess ;; 2) proto_menu vless ;; 3) proto_menu trojan ;;
+    4) do_trial ;; 5) change_domain_menu ;; 6) features_menu ;;
+    7) check_services ;; 8) backup_menu ;; 9) do_uninstall ;;
+    x|X|0|q) clear; exit 0 ;;
+  esac
+done
+__TUNNELKU_MENU__
+  chmod 644 /usr/local/lib/tunnelku/common.sh
+  chmod 755 /usr/local/lib/tunnelku/tk.py
+  chmod 755 /usr/local/bin/tunnelku
+}
+
+write_files
+# shellcheck disable=SC1091
+. /usr/local/lib/tunnelku/common.sh
+
+DOMAIN="${1:-}"
+while ! valid_domain "$DOMAIN"; do
+  read -rp "Masukkan domain (sudah diarahkan ke IP VPS ini): " DOMAIN </dev/tty
+done
+if ! check_dns "$DOMAIN"; then
+  read -rp "DNS belum cocok. Lanjut tetap? [y/N]: " yn </dev/tty
+  [[ $yn =~ ^[yY]$ ]] || exit 1
+fi
+
+: > "$LOG"; chmod 600 "$LOG"
+msg "Memasang paket... (log: $LOG)"
+run_log apt-get update -y
+export DEBIAN_FRONTEND=noninteractive
+run_log apt-get install -y curl jq nginx socat cron openssl tar ca-certificates unzip iproute2 util-linux vnstat python3 \
+  || { tail -n 15 "$LOG"; die "Gagal memasang paket dasar. Log lengkap: $LOG"; }
+
+msg "Memasang Xray..."
+XI=$(curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh 2>>"$LOG") \
+  || die "Gagal mengunduh installer Xray. Log: $LOG"
+run_log bash -c "$XI" @ install
+command -v xray >/dev/null || { tail -n 15 "$LOG"; die "Xray gagal terpasang. Log: $LOG"; }
+
+systemctl enable --now vnstat >/dev/null 2>&1 || true
+fetch_ipinfo || true
+db_init
+write_base
+echo "$DOMAIN" > "$DOMAIN_FILE"
+
+issue_cert "$DOMAIN" || die "Sertifikat gagal. Perbaiki DNS lalu jalankan ulang installer."
+write_nginx || die "Konfigurasi nginx gagal."
+rebuild || die "Konfigurasi Xray gagal."
+systemctl enable --now xray >/dev/null 2>&1
+
+printf '%s\n' \
+  "*/5 * * * * root /usr/local/bin/tunnelku --expire >/dev/null 2>&1" \
+  "* * * * * root /usr/local/bin/tunnelku --enforce >/dev/null 2>&1" > /etc/cron.d/tunnelku
+chmod 644 /etc/cron.d/tunnelku
+
+echo
+ok "Instalasi selesai."
+echo "  Domain : $DOMAIN"
+echo "  Menu   : ketik  tunnelku"
+echo
